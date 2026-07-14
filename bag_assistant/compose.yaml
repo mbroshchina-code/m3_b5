@@ -21,7 +21,7 @@ services:
     depends_on:
       redis:
         condition: service_healthy
-    # Робастный Healthcheck наставника: опрашивает готовность ручки /ready через Python
+    # Healthcheck: опрашивает готовность ручки /ready через Python
     healthcheck:
       test:
         - CMD
@@ -33,7 +33,7 @@ services:
       retries: 3
       start_period: 15s
 
-  # ⚡ 2. СЕРВИС КЭШ-СЛОЯ (Redis)
+  # 2. СЕРВИС КЭШ-СЛОЯ (Redis)
   redis:
     image: redis:7.4-alpine  # Явный тег версии по ТЗ, никакого :latest
     container_name: bag-assistant-redis
