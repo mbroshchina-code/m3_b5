@@ -1,7 +1,7 @@
 version: "3.8"
 
 services:
-  # 🤖 1. СЕРВИС НАШЕГО ВЕБ-ПРИЛОЖЕНИЯ (FastAPI)
+  # 1. СЕРВИС ВЕБ-ПРИЛОЖЕНИЯ (FastAPI)
   app:
     build:
       context: .
@@ -17,7 +17,7 @@ services:
     # Внутри Docker-сети адрес базы — это DNS-имя соседнего контейнера "redis" (не localhost)!
     environment:
       REDIS_URL: redis://redis:6379/0
-    # ТРЕБОВАНИЕ НАСТАВНИКА: Ждем полной готовности (service_healthy) кэш-слоя перед стартом API
+    # Ждем полной готовности (service_healthy) кэш-слоя перед стартом API
     depends_on:
       redis:
         condition: service_healthy
@@ -48,6 +48,6 @@ services:
       timeout: 3s
       retries: 3
 
-# ТРЕБОВАНИЕ НАСТАВНИКА: Именованный volume для персистентности (сохранения) кэша при перезагрузках
+# Именованный volume для персистентности (сохранения) кэша при перезагрузках
 volumes:
   redis_data:
