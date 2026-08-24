@@ -16,7 +16,7 @@ class ModelInfo(BaseModel):
     context_window: int | None = None
 
 
-# МОЕ НАПОЛНЕНИЕ: Список моделей, на которых реально работает баг-ассистент
+# Список моделей, на которых реально работает баг-ассистент
 AVAILABLE_MODELS: list[ModelInfo] = [
     # 1. Основная  модель через прокси 
     ModelInfo(
