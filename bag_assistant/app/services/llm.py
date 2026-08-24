@@ -1,15 +1,17 @@
 """Модуль ядра бизнес-логики ИИ-сервиса (LLM API Gateway).
 
-Полностью соответствует эталону наставника, реализует кэширование и лексический поиск.
+Полностью оптимизирован под structlog контексты и защищен от AttributeError.
 """
 
 from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
-from app.infrastructure.tools import get_tools_schema
+
+import structlog
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.core.exceptions import (
@@ -19,7 +21,6 @@ from app.core.exceptions import (
     LLMRateLimitError,
     LLMTimeoutError,
 )
-# Импортируем наш оригинальный системный промпт баг-ассистента
 from app.core.prompts import BAG_SYSTEM_PROMPT
 from app.schemas.chat import ChatDelta, ChatRequest, ChatResponse, Usage
 
@@ -34,54 +35,44 @@ try:
 except ImportError:
     APIConnectionError = APITimeoutError = AuthenticationError = BadRequestError = RateLimitError = ()  # type: ignore
 
+# Инициализируем локальный структурированный логгер
+logger = structlog.get_logger()
+
 
 class LLMService:
     """Сервис управления запросами к ИИ с поддержкой отказоустойчивости и кэша."""
 
     def __init__(self, llm: object, cache: object | None, ttl: int = 3600):
         """Инициализирует сервис компонентами из DI-контейнера."""
-        self.llm = llm  # Передается AsyncOpenAI клиент
-        self.cache = cache  # Передается Redis клиент
-        self.ttl = ttl
-        
-    async def simple_complete(self, prompt: str, req_model: str = "gpt-4o-mini") -> str:
-        """Легковесный прямой вызов ИИ без кэша и инструментов для внутренних нужд бэкэнда."""
-        try:
-            raw = await self.llm.chat.completions.create(
-                model=req_model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1, # Низкая температура для строгих синонимов
-                max_tokens=150,
-            )
-            return (raw.choices[0].message.content or "").strip()
-        except Exception as e:
-            # Если сеть OpenAI моргнула, возвращаем пустую строку, чтобы не ломать основной поиск
-            return ""
-
+        self.llm = llm  # Наш асинхронный клиент AsyncOpenAI
+        self.cache = cache  # Наш асинхронный клиент Redis
+        self.ttl = ttl  # Время жизни кэша в секундах
 
     def _key(self, req: ChatRequest) -> str:
-        """Генерирует SHA-256 хэш-ключ от полей запроса для Redis по ТЗ наставника."""
-        # Исключаем user_id и stream для детерминированности кэша
         payload = req.model_dump(exclude={"user_id", "stream", "session_id"})
         blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return "chat:" + hashlib.sha256(blob.encode()).hexdigest()
 
     def _prepare_messages(self, req: ChatRequest) -> list[dict]:
-        """Проверяет контекст и при необходимости внедряет BAG_SYSTEM_PROMPT."""
         raw_messages = [m.model_dump() for m in req.messages]
-        
-        # Если в истории нет системного промпта, принудительно ставим его в начало
         has_system = any(m["role"] == "system" for m in raw_messages)
         if not has_system:
             raw_messages.insert(0, {"role": "system", "content": BAG_SYSTEM_PROMPT})
-            
         return raw_messages
 
+    async def simple_complete(self, prompt: str, req_model: str = "gpt-4o-mini") -> str:
+        try:
+            raw = await self.llm.chat.completions.create(
+                model=req_model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=150,
+            )
+            return (raw.choices.message.content or "").strip()
+        except Exception:
+            return ""
+
     def _sync_bug_search(self, query: str) -> str:
-        """Синхронный лексический поиск по JSON базе данных багов.
-        
-        Сканирует абсолютно все текстовые поля объекта, исключая ошибки структуры ключей.
-        """
         db_path = Path(__file__).resolve().parent.parent.parent / "prompts" / "bugs_database.json"
         if not db_path.exists():
             return "Ошибка: Локальная база инцидентов BAG_ASSISTANT отсутствует."
@@ -90,7 +81,6 @@ class LLMService:
             with open(db_path, "r", encoding="utf-8") as f:
                 bugs = json.load(f)
             
-            # Разбиваем запрос на основы слов (срезаем последние 2 буквы у длинных слов)
             raw_words = [w.lower().strip() for w in query.split() if len(w) > 2]
             words = [w[:-2] if len(w) > 4 else w for w in raw_words]
 
@@ -99,83 +89,46 @@ class LLMService:
 
             found_bugs = []
             for bug in bugs:
-                # Склеиваем абсолютно ВСЕ текстовые значения полей бага в одну большую строку
-                # Это гарантирует, что мы найдем слова, где бы они ни лежали (в body, description, theme или name)
                 full_bug_text = " ".join(str(value).lower() for value in bug.values())
-                
-                # Дополнительно проверяем вложенные словари (например, старый content.body)
                 if isinstance(bug.get("content"), dict):
                     full_bug_text += " " + " ".join(str(v).lower() for v in bug["content"].values())
 
-                # Считаем совпадения урезанных корней слов в этой мега-строке тикета
                 matches = sum(1 for word in words if word in full_bug_text)
-                
-                # Если нашли хотя бы 2 совпадения корней — баг гарантированно релевантен!
                 if matches >= 2:
                     found_bugs.append(bug)
                     
             if found_bugs:
                 return json.dumps(found_bugs, ensure_ascii=False, indent=2)
             return "В базе BAG_ASSISTANT совпадений не найдено."
-            
         except Exception as e:
             return f"Ошибка парсинга базы: {e}"
 
-        
-
     async def execute_bug_search(self, query: str) -> str:
-        """Потокобезопасная обёртка над поиском багов по ТЗ наставника."""
-        # Выносим тяжелое чтение файла с диска в пул потоков (Thread Pool)
         return await asyncio.to_thread(self._sync_bug_search, query)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-    # app/services/llm.py -> Переписываем метод _call
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
-    async def _call(self, req: ChatRequest) -> ChatResponse:
-        """Выполняет защищенный сетевой вызов к OpenAI SDK с имитацией вашей оригинальной схемы тулов."""
+    async def _call(self, req: ChatRequest, queries_list: list[str], db_context: str) -> ChatResponse:
+        """Выполняет защищенный сетевой вызов к OpenAI."""
+        # Фиксируем время старта сетевого вызова ИИ
+        llm_start_time = time.perf_counter()
+        
         try:
             processed_messages = self._prepare_messages(req)
-            user_query = req.messages[-1].content if req.messages else ""
-            
-            # 1. Запускаем Query Expansion через ваш легкий simple_complete
-            expansion_prompt = (
-                f"Напиши через запятую ровно 3 разные по звучанию технические фразы-синонима "
-                f"для поискового запроса: '{user_query}'."
-            )
-            synonyms_str = await self.simple_complete(expansion_prompt, req_model=req.model)
-            
-            # Формируем массив из 3-х синонимов строго по вашей схеме инструментов
-            queries_list = [s.strip() for s in synonyms_str.split(",") if s.strip()][:3]
-            if len(queries_list) < 3:
-                # Страховка: если ИИ вернул меньше 3-х, добиваем оригинальным запросом
-                queries_list.extend([user_query] * (3 - len(queries_list)))
-
-            # 2. Вызываем лексический поиск по базе багов, передавая все фразы для сканирования
-            full_search_cloud = f"{user_query} " + " ".join(queries_list)
-            db_context = await self.execute_bug_search(full_search_cloud)
-            
-            # Имитируем уникальный ID вызова инструмента
             tool_call_id = "call_search_bug_db_123"
             
-            # 3. Вставляем в историю сообщение assistant. Текст аргументов СТРОГО соответствует вашей схеме!
             processed_messages.insert(1, {
                 "role": "assistant",
                 "content": None,
-                "tool_calls": [
-                    {
-                        "id": tool_call_id,
-                        "type": "function",
-                        "function": {
-                            "name": "search_bug_database",
-                            # Передаем JSON с ключом "queries" и массивом из 3-х синонимов!
-                            "arguments": json.dumps({"queries": queries_list}, ensure_ascii=False)
-                        }
+                "tool_calls": [{
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "search_bug_database",
+                        "arguments": json.dumps({"queries": queries_list}, ensure_ascii=False)
                     }
-                ]
+                }]
             })
             
-            # 4. Вставляем ответ от самого тула (передаем найденные баги из JSON)
             processed_messages.insert(2, {
                 "role": "tool",
                 "tool_call_id": tool_call_id,
@@ -183,16 +136,31 @@ class LLMService:
                 "content": db_context
             })
             
-            # Отправляем полный контекст в OpenAI, подключая вашу оригинальную схему get_tools_schema()
             raw = await self.llm.chat.completions.create(
                 model=req.model,
                 messages=processed_messages,  # type: ignore
                 temperature=req.temperature,
                 max_tokens=req.max_tokens,
-                tools=get_tools_schema(),  # <-- ВНЕДРИЛИ ТВОЮ ОРИГИНАЛЬНУЮ СХЕМУ!
-                tool_choice="none"
             )
-            return ChatResponse.from_openai(raw)
+            
+            # Переводим сырой ответ в нашу Pydantic-схему
+            resp = ChatResponse.from_openai(raw)
+            
+            # Рассчитываем точную задержку сетевого вызова к ИИ
+            latency_ms = (time.perf_counter() - llm_start_time) * 1000
+
+            # 🌟 ТРЕБОВАНИЕ НАСТАВНИКА: Пишем строку llm_request_completed в JSON со всеми полями!
+            # Благодаря contextvars, поля request_id, user_id, path, method добавятся сюда АВТОМАТИЧЕСКИ!
+            logger.info(
+                "llm_request_completed",
+                model=resp.model,
+                input_tokens=resp.usage.prompt_tokens,
+                output_tokens=resp.usage.completion_tokens,
+                latency_ms=round(latency_ms, 2),
+                finish_reason=resp.finish_reason
+            )
+            
+            return resp
             
         except RateLimitError as e:
             raise LLMRateLimitError(str(e)) from e
@@ -208,11 +176,11 @@ class LLMService:
         except APIConnectionError as e:
             raise LLMError(f"connection error: {e}") from e
 
-
     async def complete(self, req: ChatRequest) -> ChatResponse:
-        """Выполняет синхронный запрос ИИ, управляя логикой кэша и Query Expansion."""
+        """Выполняет синхронный запрос ИИ, управляя логикой кэша, Query Expansion и логов."""
+        start_time = time.perf_counter()
         
-        # 1. Проверяем Redis-кэш (только при temperature == 0.0 по ТЗ наставника)
+        # 1. Проверяем Redis-кэш (только при temperature == 0.0)
         key = self._key(req)
         if req.temperature == 0.0 and self.cache is not None:
             try:
@@ -220,57 +188,80 @@ class LLMService:
                 if blob:
                     resp = ChatResponse.model_validate_json(blob)
                     resp.cached = True
+                    
+                    # Пишем лог успешного попадания в кэш
+                    logger.info(
+                        "llm_request_completed",
+                        model=resp.model,
+                        input_tokens=resp.usage.prompt_tokens if resp.usage else 0,
+                        output_tokens=resp.usage.completion_tokens if resp.usage else 0,
+                        latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
+                        finish_reason=resp.finish_reason
+                    )
                     return resp
             except Exception:
                 pass
 
-        # Вытаскиваем оригинальный вопрос пользователя
         user_query = req.messages[-1].content if req.messages else ""
 
-        # ─── 🌟 ВНЕДРЯЕМ СУПЕР-ФИЧУ: QUERY EXPANSION (РАСШИРЕНИЕ ЗАПРОСА) ───
-        # Просим ИИ сгенерировать синонимы, чтобы расширить поисковое облако
+        # ─── Query Expansion ───
         expansion_prompt = (
-            f"Напиши через пробел ровно 3 разные по звучанию, но максимально близкие "
-            f"по техническому смыслу фразы-синонимы для поискового запроса: '{user_query}'. "
-            f"Пиши только поисковые слова, без знаков препинания, списков и лишнего текста."
+            f"Напиши через запятую ровно 3 разные по звучанию технические фразы-синонима "
+            f"для поискового запроса: '{user_query}'."
         )
+        synonyms_str = await self.simple_complete(expansion_prompt, req_model=req.model)
         
-        # Вызываем легкий метод генерации синонимов
-        synonyms = await self.simple_complete(expansion_prompt, req_model=req.model)
-        
-        # Склеиваем оригинальный запрос и 3 синонима от ИИ в единое текстовое облако
-        full_search_cloud = f"{user_query} {synonyms}"
-        # ───────────────────────────────────────────────────────────────────
+        queries_list = [s.strip() for s in synonyms_str.split(",") if s.strip()][:3]
+        if len(queries_list) < 3:
+            queries_list.extend([user_query] * (3 - len(queries_list)))
 
-        # 2. Вызываем локальный лексический поиск по базе багов, передавая расширенное облако
+        # 2. Локальный поиск по базе багов
+        full_search_cloud = f"{user_query} " + " ".join(queries_list)
         db_context = await self.execute_bug_search(full_search_cloud)
         
-        # Если даже с синонимами в JSON-базе ничего не нашлось — возвращаем бесплатный отлуп
+        # Переменная для хранения итогового ответа
+        resp: ChatResponse
+
+        # Если совпадений нет — возвращаем бесплатный отлуп
         if db_context == "В базе BAG_ASSISTANT совпадений не найдено.":
-            return ChatResponse(
+            resp = ChatResponse(
                 content="Подходящих багов в базе данных BAG_ASSISTANT не найдено. Запрос не относится к известным инцидентам.",
                 model=req.model,
                 usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
                 finish_reason="stop",
                 cached=False
             )
+        else:
+            # 3. Кэш-промах и баг найден: идем в сеть к OpenAI
+            resp = await self._call(req, queries_list, db_context)
+            resp.cached = False
+            
+            if req.temperature == 0.0 and self.cache is not None:
+                try:
+                    await self.cache.setex(key, self.ttl, resp.model_dump_json())
+                except Exception:
+                    pass
 
-        # 3. Кэш-промах И баг найден: идем в сеть OpenAI через защищенный метод _call
-        resp = await self._call(req)
-        resp.cached = False
+        # 🌟 ЕДИНАЯ, ЗАЩИЩЕННАЯ ТОЧКА СТРУКТУРИРОВАННОГО ЛОГИРОВАНИЯ ПО ТЗ
+        latency_ms = (time.perf_counter() - start_time) * 1000
         
-        # Записываем свежий ответ в Redis (если температура нулевая)
-        if req.temperature == 0.0 and self.cache is not None:
-            try:
-                await self.cache.setex(key, self.ttl, resp.model_dump_json())
-            except Exception:
-                pass
+        # Безопасно извлекаем токены, защищаясь от AttributeError
+        in_t = resp.usage.prompt_tokens if resp.usage else 0
+        out_t = resp.usage.completion_tokens if resp.usage else 0
+        
+        logger.info(
+            "llm_request_completed",
+            model=resp.model or req.model,
+            input_tokens=in_t,
+            output_tokens=out_t,
+            latency_ms=round(latency_ms, 2),
+            finish_reason=resp.finish_reason or "stop"
+        )
                 
         return resp
 
-
     async def stream(self, req: ChatRequest) -> AsyncIterator[ChatDelta]:
-        """Реализует потоковую генерацию (Streaming) по протоколу stream_options."""
+        """Реализует потоковую генерацию (Streaming) без кэширования."""
         processed_messages = self._prepare_messages(req)
         
         stream_engine = await self.llm.chat.completions.create(
@@ -284,7 +275,7 @@ class LLMService:
         
         async for chunk in stream_engine:
             if getattr(chunk, "choices", None):
-                delta = chunk.choices[0].delta
+                delta = chunk.choices.delta
                 if getattr(delta, "content", None):
                     yield ChatDelta(content=delta.content)
             if getattr(chunk, "usage", None):
